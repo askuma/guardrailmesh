@@ -1,0 +1,125 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "guardrailmesh"
+version = "0.1.0"
+description = "Unified AI guardrail enforcement layer. Provider-agnostic. OWASP LLM Top 10."
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Ashutosh Kumar", email = "ashuthemaddy@gmail.com" }]
+requires-python = ">=3.9"
+keywords = [
+    "guardrails",
+    "llm-security",
+    "owasp",
+    "ai-safety",
+    "prompt-injection",
+    "nemo",
+    "presidio",
+    "lakera",
+    "llm",
+    "ai-guardrails",
+    "owasp-llm-top-10",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Operating System :: OS Independent",
+]
+
+dependencies = [
+    "fastapi>=0.104.0",
+    "uvicorn[standard]>=0.24.0",
+    "pydantic>=2.0.0",
+    "httpx>=0.24.0",
+    "aiofiles>=23.0.0",
+    "sqlalchemy>=2.0.0",
+    "alembic>=1.12.0",
+    "prometheus-client>=0.18.0",
+    "python-json-logger>=2.0.0",
+]
+
+[project.optional-dependencies]
+
+presidio = [
+    "presidio-analyzer>=2.2.0",
+    "presidio-anonymizer>=2.2.0",
+    "spacy>=3.0.0",
+]
+
+nemo = [
+    "nemoguardrails>=0.6.0",
+]
+
+guardrails_ai = [
+    "guardrails-ai>=0.4.0",
+]
+
+llamafirewall = [
+    "llamafirewall>=0.1.0",
+]
+
+llm_guard = [
+    "llm-guard>=0.3.0",
+]
+
+aws = [
+    "boto3>=1.28.0",
+]
+
+redis = [
+    "redis>=5.0.0",
+]
+
+postgres = [
+    "psycopg2-binary>=2.9.0",
+]
+
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "httpx>=0.24.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+all = [
+    "guardrailmesh[presidio,nemo,guardrails_ai,llamafirewall,llm_guard,aws,redis,postgres]",
+]
+
+[project.urls]
+Homepage = "https://github.com/askuma/guardrailmesh"
+Documentation = "https://github.com/askuma/guardrailmesh/blob/main/README.md"
+"Issue Tracker" = "https://github.com/askuma/guardrailmesh/issues"
+Changelog = "https://github.com/askuma/guardrailmesh/blob/main/CHANGELOG.md"
+
+[project.scripts]
+guardrailmesh = "guardrail_framework.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["guardrail_framework*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.black]
+line-length = 100
+target-version = ["py39", "py310", "py311", "py312"]
+
+[tool.mypy]
+python_version = "3.9"
+ignore_missing_imports = true

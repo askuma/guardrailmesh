@@ -1,0 +1,30 @@
+# ── Web server (required) ─────────────────────────────────────────────────────
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+httpx>=0.24.0
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+alembic>=1.12.0
+# For PostgreSQL in production, also install: psycopg2-binary>=2.9.0
+
+# ── Monitoring ────────────────────────────────────────────────────────────────
+prometheus-client>=0.18.0
+python-json-logger>=2.0.0
+
+# ── PII detection (Presidio) ──────────────────────────────────────────────────
+presidio-analyzer>=2.2.0
+presidio-anonymizer>=2.2.0
+spacy>=3.0.0
+# After installing spacy run: python -m spacy download en_core_web_lg
+
+nemoguardrails>=0.9.0
+guardrails-ai>=0.4.0
+
+# ── Cloud moderation backends ─────────────────────────────────────────────────
+# AWS Bedrock Guardrails (set AWS_* vars to activate)
+boto3>=1.28.0
+# Meta LlamaFirewall and LLM Guard are installed via the host bind-mount
+# (./site-packages). For local dev, install manually:
+#   pip install llamafirewall llm-guard

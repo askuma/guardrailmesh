@@ -1,0 +1,44 @@
+# Before starting: copy .env.example to .env and set GUARDRAIL_API_KEYS.
+
+services:
+  guardrailmesh:
+    build: .
+    image: guardrailmesh:0.1.0
+    container_name: guardrailmesh
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - GUARDRAIL_DB_URL=sqlite:////app/data/guardrail.db
+      - LOG_LEVEL=info
+      - GUARDRAILS_TOKEN=${GUARDRAILS_TOKEN:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - NEMO_OPENAI_MODEL=${NEMO_OPENAI_MODEL:-gpt-4o-mini}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_MODEL=${OPENROUTER_MODEL:-meta-llama/llama-3.1-8b-instruct:free}
+      - AZURE_OPENAI_API_KEY=${AZURE_OPENAI_API_KEY:-}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - AZURE_OPENAI_DEPLOYMENT=${AZURE_OPENAI_DEPLOYMENT:-gpt-4o-mini}
+      - AZURE_OPENAI_API_VERSION=${AZURE_OPENAI_API_VERSION:-2024-02-15-preview}
+      - OLLAMA_BASE_URL=${OLLAMA_BASE_URL:-}
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    volumes:
+      - guardrailmesh_data:/app/data
+      - ./site-packages:/app/site-packages:ro
+      - ./hf_models:/app/hf_models
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  guardrailmesh_data:
+    driver: local
