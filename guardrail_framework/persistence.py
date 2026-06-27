@@ -14,7 +14,7 @@ from typing import Any, Dict, List, Optional
 
 from sqlalchemy import (
     Boolean, Column, DateTime, Float, Integer, String, Text, UniqueConstraint,
-    create_engine, event, select, delete as sa_delete,
+    create_engine, event, select, text as sa_text, delete as sa_delete,
 )
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
@@ -103,6 +103,15 @@ class PersistenceLayer:
         Base.metadata.create_all(self.engine)
         self._Session = sessionmaker(bind=self.engine, expire_on_commit=False)
         logger.info(f"Persistence layer ready (url={url.split('?')[0]})")
+
+    def ping(self) -> bool:
+        """Return True if the database is reachable (used by /ready health probe)."""
+        try:
+            with self.engine.connect() as conn:
+                conn.execute(sa_text("SELECT 1"))
+            return True
+        except Exception:
+            return False
 
     @contextmanager
     def _session(self):

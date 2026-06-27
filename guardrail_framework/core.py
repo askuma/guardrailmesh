@@ -2857,11 +2857,16 @@ class GuardrailFramework:
 
     def _log_audit(self, policy_id: str, action: str,
                    input_text: str, result: GuardrailResult):
+        # Never store raw input text in the audit log — it may contain PII, credentials,
+        # or other sensitive data that would create a compliance violation (GDPR/HIPAA/PCI).
+        # Store only a short SHA-256 prefix for deduplication and length for anomaly detection.
+        input_hash = hashlib.sha256(input_text.encode()).hexdigest()[:16] if input_text else ""
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "policy_id": policy_id,
             "action": action,
-            "input_preview": input_text[:120] if input_text else "",
+            "input_hash": input_hash,
+            "input_length": len(input_text) if input_text else 0,
             "passed": result.passed,
             "severity": result.severity,
             "action_taken": result.action.value,

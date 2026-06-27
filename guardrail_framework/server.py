@@ -5,10 +5,9 @@ REST API for the Guardrail Framework Abstraction Layer
 
 import logging
 import os
-from pathlib import Path
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
-from datetime import datetime, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,7 +18,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from guardrail_framework.core import (
-    GuardrailFramework, GuardrailPolicy, GuardrailBackend,
+    GuardrailFramework, GuardrailBackend,
     RiskCategory, ActionType, ABTestConfig, get_framework,
     _validate_external_url,
 )
@@ -70,6 +69,16 @@ observability = ObservabilityStack()
 compiler = PolicyCompiler()
 
 _AUTH_ENABLED = os.getenv("GUARDRAIL_AUTH_ENABLED", "true").lower() not in ("false", "0", "no")
+_DB_URL = os.getenv("GUARDRAIL_DB_URL", "sqlite:///guardrail.db")
+
+# Disabling auth with a non-SQLite database is a production misconfiguration: any
+# caller could read policies, modify guardrail rules, or access the audit log.
+if not _AUTH_ENABLED and not _DB_URL.startswith("sqlite"):
+    raise RuntimeError(
+        "GUARDRAIL_AUTH_ENABLED=false is not permitted with a non-SQLite database. "
+        "Authentication may only be disabled for local SQLite development. "
+        "Set GUARDRAIL_AUTH_ENABLED=true or use sqlite:/// for local testing."
+    )
 
 app = FastAPI(
     title="guardrailmesh API",
@@ -78,8 +87,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS — tighten allow_origins via GUARDRAIL_CORS_ORIGINS env var in production
-_cors_origins = [o.strip() for o in os.getenv("GUARDRAIL_CORS_ORIGINS", "*").split(",")]
+# CORS — default is no cross-origin access (safe for server-to-server API use).
+# Set GUARDRAIL_CORS_ORIGINS=https://app.example.com to allow browser clients.
+# GUARDRAIL_CORS_ORIGINS=* is permitted but logs a warning; never use it in production.
+_cors_raw = os.getenv("GUARDRAIL_CORS_ORIGINS", "").strip()
+if _cors_raw == "*":
+    logger.warning(
+        "GUARDRAIL_CORS_ORIGINS=* allows any browser origin to call this API. "
+        "Set an explicit origin list in production (e.g. https://app.example.com)."
+    )
+_cors_origins = [o.strip() for o in _cors_raw.split(",") if o.strip()] if _cors_raw else []
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
@@ -94,6 +111,19 @@ app.add_middleware(APIKeyMiddleware, api_keys=_api_keys, enabled=_AUTH_ENABLED)
 # Admin key tier — subset of keys allowed to call destructive write operations.
 # Falls back to all API keys when GUARDRAIL_ADMIN_KEYS is unset (backward-compatible).
 _admin_keys = load_admin_keys(_api_keys)
+
+
+@app.middleware("http")
+async def propagate_request_id(request: Request, call_next):
+    """Echo the caller's X-Request-ID header (or generate one) on every response.
+
+    This allows distributed tracing across the LLM app, guardrail service, and
+    audit log using a single correlation ID without requiring a tracing SDK.
+    """
+    request_id = request.headers.get("X-Request-ID") or str(uuid.uuid4())
+    response = await call_next(request)
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
 def require_admin_key(request: Request) -> None:
@@ -112,21 +142,48 @@ def require_admin_key(request: Request) -> None:
 
 # ─── Request / Response Models ────────────────────────────────────────────────
 
+# Configurable via env var; default matches ~8k tokens (safe for most LLM context windows).
+_MAX_TEXT_LENGTH = int(os.getenv("GUARDRAIL_MAX_TEXT_LENGTH", "32000"))
+
+
+def _validate_text_length(v: str) -> str:
+    if len(v) > _MAX_TEXT_LENGTH:
+        raise ValueError(
+            f"text length {len(v)} exceeds the maximum of {_MAX_TEXT_LENGTH} characters. "
+            f"Increase GUARDRAIL_MAX_TEXT_LENGTH if your use case requires longer inputs."
+        )
+    return v
+
+
 class CheckInputRequest(BaseModel):
     text: str
     policy_id: str
     context: Optional[Dict[str, Any]] = None
+
+    @field_validator("text")
+    @classmethod
+    def _check_text_length(cls, v: str) -> str:
+        return _validate_text_length(v)
+
 
 class CheckOutputRequest(BaseModel):
     text: str
     policy_id: str
     context: Optional[Dict[str, Any]] = None
 
+    @field_validator("text")
+    @classmethod
+    def _check_text_length(cls, v: str) -> str:
+        return _validate_text_length(v)
+
 class ValidateToolRequest(BaseModel):
     policy_id: str
     tool_name: str
     tool_args: Dict[str, Any]
     context: Optional[Dict[str, Any]] = None
+
+_VALID_SENSITIVITIES = frozenset({"low", "medium", "high"})
+
 
 class CreatePolicyRequest(BaseModel):
     name: str
@@ -139,11 +196,26 @@ class CreatePolicyRequest(BaseModel):
     rules: Optional[Dict[str, Any]] = {}
     tags: Optional[List[str]] = []
 
+    @field_validator("sensitivity")
+    @classmethod
+    def _check_sensitivity(cls, v: str) -> str:
+        if v not in _VALID_SENSITIVITIES:
+            raise ValueError(f"sensitivity must be one of: {sorted(_VALID_SENSITIVITIES)}")
+        return v
+
+
 class UpdatePolicyRequest(BaseModel):
     sensitivity: Optional[str] = None
     action_on_violation: Optional[str] = None
     enabled: Optional[bool] = None
     rules: Optional[Dict[str, Any]] = None
+
+    @field_validator("sensitivity")
+    @classmethod
+    def _check_sensitivity(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_SENSITIVITIES:
+            raise ValueError(f"sensitivity must be one of: {sorted(_VALID_SENSITIVITIES)}")
+        return v
 
 class CreateABTestRequest(BaseModel):
     name: str
@@ -157,16 +229,21 @@ class CreateABTestRequest(BaseModel):
 
 @app.get("/health", tags=["System"])
 def health():
-    return {
-        "status": "ok",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "version": "1.0.0",
-        "backends": list(framework.backends.keys()),
-        "policies_loaded": len(framework.policies),
-    }
+    # Return only the minimum needed for a liveness probe.
+    # Backend names and policy counts are internal topology — never expose them
+    # on an unauthenticated endpoint.
+    return {"status": "ok", "version": "0.1.0"}
+
 
 @app.get("/ready", tags=["System"])
 def ready():
+    # Real readiness: verify the database is reachable before accepting traffic.
+    # Kubernetes will hold the pod out of rotation until this returns 200.
+    if framework._persistence and not framework._persistence.ping():
+        return JSONResponse(
+            status_code=503,
+            content={"ready": False, "reason": "db_unavailable"},
+        )
     return {"ready": True}
 
 # ─── Guardrail Checks ─────────────────────────────────────────────────────────
@@ -500,14 +577,13 @@ if __name__ == "__main__":
 # OPA GAP IMPLEMENTATIONS — new routes wired in below
 # ═════════════════════════════════════════════════════════════════════════════
 from guardrail_framework.testing    import PolicyTestRunner, PolicyTestCase
-from guardrail_framework.decision_log import DecisionLogShipper, DecisionEvent
+from guardrail_framework.decision_log import DecisionLogShipper
 from guardrail_framework.bundle     import (
     BundleBuilder, BundleLoader, BundlePoller,
     PolicyVersionStore, push_channel,
 )
 from guardrail_framework.opa_gaps   import (
-    PrometheusMetrics, StatusReporter, DataProviderRegistry,
-    WasmReadyScorer, PolicyPrecompiler, StaticBlocklistProvider,
+    PolicyPrecompiler, StaticBlocklistProvider,
     prom_metrics, status_reporter, data_registry, wasm_scorer,
 )
 from fastapi.responses import PlainTextResponse, StreamingResponse

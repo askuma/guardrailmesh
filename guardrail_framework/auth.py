@@ -28,13 +28,15 @@ from starlette.requests import Request
 logger = logging.getLogger("auth")
 
 # Exact paths that are always public (no API key needed).
+# /metrics/prometheus is intentionally NOT listed here — it exposes internal
+# policy topology and must be scraped from within the private network via a
+# service account key, not exposed to the public internet.
 _PUBLIC_PATHS: Set[str] = {
     "/health",
     "/ready",
     "/docs",
     "/openapi.json",
     "/redoc",
-    "/metrics/prometheus",   # Prometheus scrape — secure at network level
     "/push/events",          # auth handled in route handler via ?api_key= query param
 }
 

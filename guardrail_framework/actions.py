@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import smtplib
+import threading
 import urllib.request
 from email.mime.text import MIMEText
 from typing import Any, Dict, List, Optional
@@ -51,10 +52,15 @@ def escalate(
 
 
 def _send_webhook(payload: Dict) -> None:
+    """Fire-and-forget: spawn a daemon thread so the check response is never blocked."""
     url = os.getenv("GUARDRAIL_ESCALATION_WEBHOOK_URL", "").strip()
     if not url:
         logger.debug("GUARDRAIL_ESCALATION_WEBHOOK_URL not set — skipping webhook.")
         return
+    threading.Thread(target=_do_webhook_post, args=(url, payload), daemon=True).start()
+
+
+def _do_webhook_post(url: str, payload: Dict) -> None:
     try:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
@@ -71,11 +77,19 @@ def _send_webhook(payload: Dict) -> None:
 
 
 def _send_email(to_addr: str, policy_name: str, payload: Dict) -> None:
+    """Fire-and-forget: spawn a daemon thread so the check response is never blocked."""
     smtp_host = os.getenv("GUARDRAIL_SMTP_HOST", "").strip()
     if not smtp_host:
         logger.debug("GUARDRAIL_SMTP_HOST not set — skipping escalation email.")
         return
+    threading.Thread(
+        target=_do_email_send,
+        args=(to_addr, policy_name, payload, smtp_host),
+        daemon=True,
+    ).start()
 
+
+def _do_email_send(to_addr: str, policy_name: str, payload: Dict, smtp_host: str) -> None:
     smtp_port = int(os.getenv("GUARDRAIL_SMTP_PORT", "587"))
     smtp_user = os.getenv("GUARDRAIL_SMTP_USER", "")
     smtp_pass = os.getenv("GUARDRAIL_SMTP_PASS", "")
@@ -138,7 +152,7 @@ _INJECTION_SENTENCE_PATS = [
 ]
 
 
-def rewrite_text(text: str, detected_risks: Optional[List[Dict]] = None) -> str:
+def rewrite_text(text: str, _detected_risks: Optional[List[Dict]] = None) -> str:
     """
     Redact/rewrite text by:
     1. Removing sentences that contain injection/jailbreak phrases.

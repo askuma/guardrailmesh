@@ -103,7 +103,7 @@ def example_multi_backend():
         GuardrailBackend.OPENAI_MODERATION, # OpenAI Moderation API
         # ── Requires cloud credentials ───────────────────────────────────────
         GuardrailBackend.LAKERA,            # LAKERA_GUARD_API_KEY
-        GuardrailBackend.GA_GUARD,          # GA_GUARD_API_KEY
+        GuardrailBackend.CUSTOM,            # GA_GUARD_API_URL + GA_GUARD_API_KEY
         GuardrailBackend.AZURE_CONTENT_SAFETY,   # AZURE_CONTENT_SAFETY_ENDPOINT + KEY
         GuardrailBackend.AZURE_PROMPT_SHIELDS,   # AZURE_CONTENT_SAFETY_ENDPOINT + KEY
         GuardrailBackend.AWS_BEDROCK,            # AWS_* credentials + guardrail ARN
