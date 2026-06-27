@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.1.1] — 2026-06-28
+
+### Security / Production hardening
+
+- **Audit log no longer stores raw input text.** `input_preview` replaced with `input_hash` (16-char SHA-256 prefix) and `input_length`. Prevents PII, credentials, and sensitive content from appearing in audit records — required for GDPR/HIPAA/PCI compliance.
+- **`/metrics/prometheus` now requires an API key.** Removed from the public-path allowlist; Prometheus scrapers must send `X-API-Key`. Previously, internal topology (policy IDs, backend names, block rates) was exposed to unauthenticated callers.
+- **`GUARDRAIL_AUTH_ENABLED=false` blocked in production.** Raises `RuntimeError` at startup when the database is not SQLite. Auth can only be disabled for local development against a local SQLite file.
+- **CORS defaults to no origins.** `GUARDRAIL_CORS_ORIGINS` previously defaulted to `*`, allowing any browser origin to call the API. Default is now an empty list (no cross-origin access). Setting `*` explicitly logs a startup warning.
+- **Escalation webhook and email are now fire-and-forget.** Both run in daemon threads so a slow or unreachable notification target never adds latency to a guardrail check response.
+- **Fixed `GuardrailBackend.GA_GUARD` AttributeError** in `examples.py`. The enum value does not exist; corrected to `GuardrailBackend.CUSTOM` with a comment pointing to the `GA_GUARD_API_URL` env var.
+
+### Added
+
+- **`X-Request-ID` middleware.** Every response now echoes the caller's `X-Request-ID` header (or generates a UUID if absent), enabling end-to-end trace correlation across the LLM application, guardrailmesh, and the audit sink.
+- **Real `/ready` readiness probe.** Previously always returned `{"ready": true}`. Now calls `PersistenceLayer.ping()` (`SELECT 1`) and returns `503 {"ready": false, "reason": "db_unavailable"}` when the database is unreachable. Kubernetes will hold replicas out of rotation until the DB recovers.
+- **`PersistenceLayer.ping()`** — lightweight `SELECT 1` health check used by `/ready`.
+- **Input size limit on check endpoints.** `POST /check/input`, `/check/output`, and `/check/tool` now reject text exceeding `GUARDRAIL_MAX_TEXT_LENGTH` characters (default `32000`) with HTTP 422, preventing OOM from oversized payloads.
+- **`sensitivity` enum validation on policy create and update.** Values outside `{low, medium, high}` now return HTTP 422 with a clear error message instead of silently mapping to the `medium` threshold.
+
+### Changed
+
+- **`/health` no longer exposes internal topology.** Response trimmed to `{status, version}`. Backend names and policy count were previously visible on an unauthenticated endpoint.
+- **Escalation email** extracted into `_do_email_send()` worker function; `_send_email()` is now a non-blocking launcher.
+- **Escalation webhook** extracted into `_do_webhook_post()` worker function; `_send_webhook()` is now a non-blocking launcher.
+- Removed 7 unused imports from `server.py` (`Path`, `datetime`, `timezone`, `GuardrailPolicy`, `DecisionEvent`, `PrometheusMetrics`, `WasmReadyScorer`, `StatusReporter`, `DataProviderRegistry`).
+
+---
+
 ## [0.1.0] — 2026-06-25
 
 ### Added

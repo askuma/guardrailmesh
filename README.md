@@ -3,7 +3,7 @@
 **Unified AI guardrail enforcement layer. Provider-agnostic. OWASP LLM Top 10.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.0-orange.svg)](https://pypi.org/project/guardrailmesh/)
+[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.1-orange.svg)](https://pypi.org/project/guardrailmesh/)
 [![Backends](https://img.shields.io/badge/Backends-10-blue.svg)](guardrail_framework/core.py)
 
 ---
@@ -97,6 +97,8 @@ guardrailmesh serve
 
 All backends degrade gracefully to regex/keyword heuristics when the SDK is not installed.
 
+> **Important:** The regex fallback is suitable for local development only. Install at least one real backend before handling production traffic.
+
 ### Custom endpoint
 
 Set `GA_GUARD_API_URL` to connect any internal guardrail HTTP endpoint. The adapter auto-detects your response schema (`flagged`, `safe`, `blocked`, `decision`, `result`, native formats).
@@ -112,12 +114,122 @@ Set `GA_GUARD_API_URL` to connect any internal guardrail HTTP endpoint. The adap
 - `POST /check/tool` — validate agent tool calls
 - `GET/POST /policies` — CRUD for guardrail policies
 - `GET/POST /abtests` — A/B test two policies against live traffic
-- `GET /metrics/prometheus` — Prometheus scrape endpoint
+- `GET /metrics/prometheus` — Prometheus scrape endpoint *(requires API key)*
 - `GET /push/events` — Server-Sent Events for real-time policy updates
 - `POST /bundles/import` — OPA-compatible bundle import
 - `GET /status` — per-policy health and latency percentiles
+- `GET /health` — liveness probe (public)
+- `GET /ready` — readiness probe; returns 503 if the database is unreachable (public)
 
 Full API reference: [/docs](http://localhost:8000/docs) (Swagger UI)
+
+### Request correlation
+
+Every response includes an `X-Request-ID` header. Pass your own `X-Request-ID` on the request and it is echoed back, enabling end-to-end trace correlation across your LLM application, guardrailmesh, and your audit sink without a tracing SDK.
+
+---
+
+## Production deployment
+
+### Required environment variables
+
+| Variable | Required | Description |
+|---|---|---|
+| `GUARDRAIL_API_KEYS` | Yes | Comma-separated API keys for all callers (min 32 chars each) |
+| `GUARDRAIL_ADMIN_KEYS` | Yes | Subset of keys permitted to call destructive endpoints (policy delete, bundle import, rollback) |
+| `GUARDRAIL_DB_URL` | Yes | PostgreSQL connection string — `sqlite:///` is for development only |
+| `GUARDRAIL_REDIS_URL` | Yes (multi-replica) | Redis URL for cross-replica rate limiting; without it limits are per-process |
+| `GUARDRAIL_CORS_ORIGINS` | Yes (browser clients) | Explicit origin list e.g. `https://app.example.com`; defaults to no CORS |
+| `GUARDRAIL_MAX_TEXT_LENGTH` | No | Max characters accepted on `/check/*` endpoints (default: `32000`) |
+| `GUARDRAIL_DECISION_LOG_SINK_URL` | Recommended | HTTPS endpoint to ship audit events for compliance retention |
+| `GUARDRAIL_DECISION_LOG_AUTH_TOKEN` | Recommended | Bearer token for the decision log sink |
+| `GUARDRAIL_ESCALATION_WEBHOOK_URL` | No | HTTPS webhook for ESCALATE-action notifications |
+
+> **Auth guard:** Setting `GUARDRAIL_AUTH_ENABLED=false` raises a `RuntimeError` at startup when the database is not SQLite. Auth can only be disabled for local development against a local SQLite file.
+
+### Infrastructure
+
+```
+Internet
+  └─ TLS termination (nginx / AWS ALB / GCP GLB)
+       └─ guardrailmesh (2+ replicas)
+            ├─ PostgreSQL  (RDS / Cloud SQL — policy store + audit log)
+            └─ Redis        (ElastiCache / Memorystore — cross-replica rate limits)
+```
+
+- **TLS**: terminate at the load balancer; never expose port 8000 directly.
+- **PostgreSQL**: set `GUARDRAIL_DB_URL=postgresql+psycopg2://user:pass@host/db`.
+- **Redis**: set `GUARDRAIL_REDIS_URL=rediss://...` (TLS). Without Redis, rate limits are per-process and will not be consistent under horizontal scaling.
+- **Secrets**: inject all keys via a secrets manager (Vault, AWS Secrets Manager, Kubernetes secrets). Do not bake them into container images.
+
+### CORS
+
+CORS defaults to **no origins allowed**, which is correct for server-to-server API usage. Enable it only when a browser client needs direct access:
+
+```bash
+GUARDRAIL_CORS_ORIGINS=https://app.example.com,https://admin.example.com
+```
+
+Setting `GUARDRAIL_CORS_ORIGINS=*` is accepted but logs a warning at startup. Never use it in production.
+
+### Prometheus metrics
+
+`GET /metrics/prometheus` requires an API key (`X-API-Key` header). Configure your Prometheus scraper with a dedicated read-only key from `GUARDRAIL_API_KEYS`:
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: guardrailmesh
+    static_configs:
+      - targets: ['guardrailmesh:8000']
+    authorization:
+      type: Bearer
+      credentials: <your-api-key>
+```
+
+### Audit log compliance
+
+The audit log stores `input_hash` (16-char SHA-256 prefix) and `input_length` per check — **never the raw input text**. This satisfies GDPR/HIPAA/PCI requirements for audit trails that must not contain personal data.
+
+Ship decision events to an append-only sink for durable retention:
+
+```bash
+POST /decision-log/configure
+{
+  "sink_url": "https://logs.example.com/guardrail/decisions",
+  "auth_token": "...",
+  "flush_interval_secs": 10
+}
+```
+
+Retention periods by framework: GDPR 30 days · PCI-DSS 1 year · HIPAA 6 years.
+
+### Readiness vs liveness
+
+| Endpoint | Probe type | Behaviour |
+|---|---|---|
+| `GET /health` | Liveness | Always returns `200 {status: ok}` if the process is alive |
+| `GET /ready` | Readiness | Returns `503 {ready: false, reason: db_unavailable}` when PostgreSQL is unreachable; Kubernetes will hold the pod out of rotation until the DB recovers |
+
+### Input size limits
+
+Check endpoints reject text longer than `GUARDRAIL_MAX_TEXT_LENGTH` characters (default 32 000 ≈ 8 k tokens) with HTTP 422. Tune this to match your LLM's context window:
+
+```bash
+GUARDRAIL_MAX_TEXT_LENGTH=16000   # GPT-4o 4k-token context
+GUARDRAIL_MAX_TEXT_LENGTH=128000  # Claude 32k-token context
+```
+
+### Backend selection for production
+
+| Need | Recommended backend |
+|---|---|
+| Prompt injection / jailbreaks (no API key) | `llama_firewall` or `llm_guard` |
+| PII detection and redaction | `presidio` (install `presidio-analyzer presidio-anonymizer en-core-web-lg`) |
+| Content moderation (cloud) | `openai_moderation` **or** `azure_content_safety` — not both |
+| Agent tool allowlisting | Any backend + `allowed_tools` in policy `rules` |
+
+Always prefer an allowlist (`allowed_tools`) over a denylist (`forbidden_tools`) for agent tool control. A denylist misses novel tool names introduced by future agents.
 
 ---
 
