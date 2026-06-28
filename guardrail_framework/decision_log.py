@@ -141,30 +141,48 @@ class DecisionLogShipper:
 
     # ── enqueue ────────────────────────────────────────────────
 
+    @staticmethod
+    def _scrub_risk_text(risks: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove the raw matched text span from risk entries before storage.
+
+        Presidio and regex backends store the literal matched value (e.g. a
+        credit card number or email address) in the ``"text"`` key of each risk
+        dict.  That field must never be written to the audit_log, consistent
+        with the ``_log_audit`` policy of hashing rather than storing raw input.
+        """
+        return [{k: v for k, v in r.items() if k != "text"} for r in risks]
+
     def _dead_letter(self, events: List[DecisionEvent], reason: str) -> None:
         """
         Persist events to the local audit_log table when they cannot be shipped.
 
         This prevents compliance audit gaps when the remote sink is unavailable
-        or the in-memory queue is full.  The ``extra`` JSON column stores the
-        full decision event so events can be replayed later.
+        or the in-memory queue is full.  Raw PII text spans are stripped from
+        ``detected_risks`` before storage (mirrors the ``_log_audit`` PII policy).
         """
         if not self._persistence:
             return
         for event in events:
             try:
+                event_dict = asdict(event)
+                # Strip raw matched-text spans from risk entries — Presidio and
+                # the regex fallback store literal PII (email, SSN, card numbers)
+                # in the "text" key.  Never store that in the audit_log.
+                event_dict["detected_risks"] = self._scrub_risk_text(
+                    event_dict.get("detected_risks", [])
+                )
                 self._persistence.append_audit({
-                    "policy_id":    event.policy_id,
-                    "action":       "decision_log_dead_letter",
-                    "passed":       event.passed,
-                    "severity":     "warning",
-                    "action_taken": event.action_taken,
-                    "risk_score":   event.risk_score,
-                    "latency_ms":   event.latency_ms,
-                    "backend":      event.backend,
-                    "request_id":   event.decision_id,
+                    "policy_id":          event.policy_id,
+                    "action":             "decision_log_dead_letter",
+                    "passed":             event.passed,
+                    "severity":           "warning",
+                    "action_taken":       event.action_taken,
+                    "risk_score":         event.risk_score,
+                    "latency_ms":         event.latency_ms,
+                    "backend":            event.backend,
+                    "request_id":         event.decision_id,
                     "dead_letter_reason": reason,
-                    **asdict(event),
+                    **event_dict,
                 })
                 self.events_dead_lettered += 1
             except Exception as exc:

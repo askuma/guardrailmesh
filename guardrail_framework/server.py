@@ -389,7 +389,7 @@ def create_policy(req: CreatePolicyRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
-@app.patch("/policies/{policy_id}", tags=["Policies"])
+@app.patch("/policies/{policy_id}", tags=["Policies"], dependencies=[Depends(require_admin_key)])
 def update_policy(policy_id: str, req: UpdatePolicyRequest):
     """Update an existing policy."""
     if policy_id not in framework.policies:
@@ -729,7 +729,7 @@ def run_builtin_tests(policy_id: str):
 
 # ── Gap 3: Decision log shipping ──────────────────────────────────────────────
 
-@app.post("/decision-log/configure", tags=["Decision Logging"])
+@app.post("/decision-log/configure", tags=["Decision Logging"], dependencies=[Depends(require_admin_key)])
 def configure_decision_log(cfg: DecisionLogConfig):
     """Configure and start the remote decision log shipper."""
     global _decision_shipper
@@ -754,7 +754,7 @@ def decision_log_stats():
     return {"configured": True, **_decision_shipper.stats()}
 
 
-@app.post("/decision-log/stop", tags=["Decision Logging"])
+@app.post("/decision-log/stop", tags=["Decision Logging"], dependencies=[Depends(require_admin_key)])
 def stop_decision_log():
     """Flush and stop the decision log shipper."""
     global _decision_shipper

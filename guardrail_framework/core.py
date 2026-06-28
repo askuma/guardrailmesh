@@ -2932,6 +2932,11 @@ class GuardrailFramework:
         self.metrics: Dict[str, Any] = {}
         self._version_store: Optional[Any] = None
         self._persistence: Optional[Any] = None   # set via set_persistence()
+        # One asyncio.Lock per backend singleton.  Acquired around the
+        # _inject_policy_rules + await backend.acheck_* sequence to prevent
+        # concurrent async requests from cross-contaminating each other's
+        # policy config (sensitivity, allowed_tools, etc.) on the shared backend.
+        self._backend_locks: Dict[str, _asyncio.Lock] = {}
         self._initialize_backends()
 
     def _initialize_backends(self):
@@ -2987,6 +2992,16 @@ class GuardrailFramework:
                 self.logger.error("PRODUCTION SAFETY RISK: %s", msg)
             else:
                 self.logger.warning(msg)
+
+    def _backend_lock(self, backend_key: str) -> _asyncio.Lock:
+        """Return the per-backend asyncio.Lock, creating it on first use.
+
+        Lazy creation is safe here because asyncio is single-threaded — no two
+        coroutines can execute this method concurrently, so there is no TOCTOU.
+        """
+        if backend_key not in self._backend_locks:
+            self._backend_locks[backend_key] = _asyncio.Lock()
+        return self._backend_locks[backend_key]
 
     def set_persistence(self, layer: Any):
         """Wire in a PersistenceLayer. Call from server startup."""
@@ -3266,13 +3281,18 @@ class GuardrailFramework:
             return rate_result
 
         enriched = data_registry.enrich(context or {})
-        self._inject_policy_rules(backend, policy)
 
-        try:
-            result = await backend.acheck_input(text, enriched)
-        except Exception as exc:
-            self.logger.error(f"Backend error in check_input_async: {exc}")
-            result = fail_closed_result(str(exc))
+        # Lock the backend singleton for the duration of config-inject + await.
+        # Without this, two concurrent async requests for different policies
+        # sharing the same backend can overwrite each other's sensitivity /
+        # allowed_tools config between _inject_policy_rules and the actual check.
+        async with self._backend_lock(policy.backend.value):
+            self._inject_policy_rules(backend, policy)
+            try:
+                result = await backend.acheck_input(text, enriched)
+            except Exception as exc:
+                self.logger.error(f"Backend error in check_input_async: {exc}")
+                result = fail_closed_result(str(exc))
 
         result = self._apply_post_actions(result, policy, policy_id)
         self._log_audit(policy_id, "input_check", text, result)
@@ -3317,13 +3337,14 @@ class GuardrailFramework:
             return rate_result
 
         enriched = data_registry.enrich(context or {})
-        self._inject_policy_rules(backend, policy)
 
-        try:
-            result = await backend.acheck_output(text, enriched)
-        except Exception as exc:
-            self.logger.error(f"Backend error in check_output_async: {exc}")
-            result = fail_closed_result(str(exc))
+        async with self._backend_lock(policy.backend.value):
+            self._inject_policy_rules(backend, policy)
+            try:
+                result = await backend.acheck_output(text, enriched)
+            except Exception as exc:
+                self.logger.error(f"Backend error in check_output_async: {exc}")
+                result = fail_closed_result(str(exc))
 
         result = self._apply_post_actions(result, policy, policy_id)
         self._log_audit(policy_id, "output_check", text, result)
@@ -3369,13 +3390,14 @@ class GuardrailFramework:
             return rate_result
 
         enriched = data_registry.enrich(context or {})
-        self._inject_policy_rules(backend, policy)
 
-        try:
-            result = await backend.avalidate_tool_call(tool_name, tool_args, enriched)
-        except Exception as exc:
-            self.logger.error(f"Backend error in validate_tool_call_async: {exc}")
-            result = fail_closed_result(str(exc))
+        async with self._backend_lock(policy.backend.value):
+            self._inject_policy_rules(backend, policy)
+            try:
+                result = await backend.avalidate_tool_call(tool_name, tool_args, enriched)
+            except Exception as exc:
+                self.logger.error(f"Backend error in validate_tool_call_async: {exc}")
+                result = fail_closed_result(str(exc))
 
         result = self._apply_post_actions(result, policy, policy_id)
         self._log_audit(policy_id, "tool_validation", tool_name, result)
