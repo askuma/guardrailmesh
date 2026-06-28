@@ -14,11 +14,15 @@ from .core import (
     RiskCategory,
     ActionType,
     ABTestConfig,
+    GuardrailBlocked,
+    GuardrailError,
     get_framework,
 )
+from .middleware import GuardrailMiddleware
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 __all__ = [
+    # Core framework
     "GuardrailFramework",
     "GuardrailPolicy",
     "GuardrailBackend",
@@ -27,4 +31,9 @@ __all__ = [
     "ActionType",
     "ABTestConfig",
     "get_framework",
+    # Exceptions
+    "GuardrailBlocked",
+    "GuardrailError",
+    # Middleware
+    "GuardrailMiddleware",
 ]

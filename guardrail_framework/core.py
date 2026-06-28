@@ -16,6 +16,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import httpx as _httpx
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, asdict
 from enum import Enum
@@ -249,6 +250,37 @@ class ABTestConfig:
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+# ── SDK exception hierarchy ────────────────────────────────────────────────────
+
+
+class GuardrailError(Exception):
+    """Raised when the guardrail framework encounters an internal error."""
+
+
+class GuardrailBlocked(Exception):
+    """
+    Raised by check_input_async / check_output_async / validate_tool_call_async
+    when the check fails and ``raise_on_block=True`` is set.
+
+    Attributes:
+        result: The full :class:`GuardrailResult` from the failing check.
+
+    Example::
+
+        try:
+            await fw.check_input_async(msg, policy_id, raise_on_block=True)
+        except GuardrailBlocked as exc:
+            return {"error": "blocked", "action": exc.result.action.value}
+    """
+
+    def __init__(self, result: "GuardrailResult") -> None:
+        self.result = result
+        super().__init__(
+            f"Guardrail blocked: action={result.action.value} "
+            f"risks={[r.get('type') for r in result.detected_risks]}"
+        )
+
+
 class GuardrailBackendInterface(ABC):
     """Abstract interface all backends must implement"""
 
@@ -317,6 +349,31 @@ class GuardrailBackendInterface(ABC):
                 return True, "tool not in allowlist"
 
         return False, ""
+
+    # ── Default async methods — override in HTTP-based subclasses ─────────────
+    # The default implementation offloads the sync method to a thread-pool
+    # executor so awaiting these never blocks the event loop.  REST-backed
+    # subclasses (Lakera, OpenAI Moderation, Azure, Custom HTTP) override with
+    # a true coroutine using httpx.AsyncClient.
+
+    async def acheck_input(self, text: str, context: Optional[Dict] = None) -> "GuardrailResult":
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.check_input, text, context)
+
+    async def acheck_output(self, text: str, context: Optional[Dict] = None) -> "GuardrailResult":
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(None, self.check_output, text, context)
+
+    async def avalidate_tool_call(
+        self,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        context: Optional[Dict] = None,
+    ) -> "GuardrailResult":
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            None, self.validate_tool_call, tool_name, tool_args, context
+        )
 
 
 # ── NeMo Guardrails backend ────────────────────────────────────────────────────
@@ -1103,6 +1160,92 @@ class LakeraGuardBackend(GuardrailBackendInterface):
     def apply_policy(self, _policy: GuardrailPolicy) -> bool:
         return True
 
+    # ── Async overrides (true httpx coroutines, no thread executor) ───────────
+
+    async def _acall_api_async(
+        self, url: str, text: str, role: str = "user"
+    ) -> Tuple[bool, float, List[Dict]]:
+        api_key = self._api_key()
+        if not api_key:
+            raise ValueError("Lakera Guard API key not configured. Set LAKERA_GUARD_API_KEY.")
+        payload = {"messages": [{"role": role, "content": text}], "breakdown": True}
+        async with _httpx.AsyncClient(timeout=10.0) as client:
+            resp = await client.post(
+                url, json=payload,
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        flagged = bool(data.get("flagged", False))
+        risks = [
+            {"type": item.get("detector_type", "unknown"),
+             "confidence": item.get("result", ""),
+             "source": "lakera_guard"}
+            for item in data.get("breakdown", []) if item.get("detected")
+        ]
+        return flagged, (1.0 if flagged else 0.0), risks
+
+    async def acheck_input(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        if not self._api_key():
+            return self._skipped_result()
+        result = GuardrailResult(backend_used=GuardrailBackend.LAKERA)
+        start = time.time()
+        try:
+            flagged, score, risks = await self._acall_api_async(self._INPUT_URL, text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = ActionType.BLOCK
+                result.severity = "critical"
+        except _httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (401, 403):
+                self.logger.warning("Lakera auth error %d — marking SKIPPED", code)
+                return self._skipped_result(f"Invalid API key (HTTP {code})")
+            self.logger.error("Lakera API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Lakera API error: {exc}")
+        except Exception as exc:
+            self.logger.error("Lakera API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Lakera API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
+    async def acheck_output(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        if not self._api_key():
+            return self._skipped_result()
+        result = GuardrailResult(backend_used=GuardrailBackend.LAKERA)
+        start = time.time()
+        result.original_text = text
+        try:
+            flagged, score, risks = await self._acall_api_async(self._OUTPUT_URL, text, role="assistant")
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = ActionType.REDACT
+                result.severity = "critical"
+                from .actions import rewrite_text
+                result.modified_text = rewrite_text(text, risks)
+            else:
+                result.modified_text = text
+        except _httpx.HTTPStatusError as exc:
+            code = exc.response.status_code
+            if code in (401, 403):
+                self.logger.warning("Lakera auth error %d — marking SKIPPED", code)
+                return self._skipped_result(f"Invalid API key (HTTP {code})")
+            self.logger.error("Lakera API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Lakera API error: {exc}")
+        except Exception as exc:
+            self.logger.error("Lakera API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Lakera API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
 
 # ── Custom HTTP backend ────────────────────────────────────────────────────────
 
@@ -1299,6 +1442,56 @@ class CustomHTTPBackend(GuardrailBackendInterface):
 
     def apply_policy(self, _policy: GuardrailPolicy) -> bool:
         return True
+
+    # ── Async override using httpx.AsyncClient ────────────────────────────────
+
+    async def _acall_api_async(
+        self, text: str, context: Optional[Dict]
+    ) -> Tuple[bool, float, List[Dict]]:
+        url = self._api_url()
+        if not url:
+            raise ValueError("GA Guard API URL not configured. Set GA_GUARD_API_URL.")
+        text_field    = os.getenv("GA_GUARD_TEXT_FIELD",    "text").strip()
+        context_field = os.getenv("GA_GUARD_CONTEXT_FIELD", "context").strip()
+        headers = {"Content-Type": "application/json", **self._auth_headers()}
+        payload = {text_field: text, context_field: context or {}}
+        async with _httpx.AsyncClient(timeout=float(self._timeout())) as client:
+            resp = await client.post(url, json=payload, headers=headers)
+            resp.raise_for_status()
+            data = resp.json()
+        return self._normalize_response(data)
+
+    async def acheck_input(self, text: str, context: Optional[Dict] = None) -> GuardrailResult:
+        result = GuardrailResult(backend_used=GuardrailBackend.CUSTOM)
+        start = time.time()
+        try:
+            if self._api_url():
+                passed, score, risks = await self._acall_api_async(text, context)
+            else:
+                passed, score, risks = self._fallback_check(text, context)
+            result.risk_score = score
+            result.passed = passed
+            result.detected_risks = risks
+            if not passed:
+                result.action = ActionType.BLOCK
+                result.severity = "critical" if score > 0.8 else "warning"
+        except Exception as exc:
+            self.logger.error("Custom HTTP API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Custom HTTP API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
+    async def acheck_output(self, text: str, context: Optional[Dict] = None) -> GuardrailResult:
+        result = await self.acheck_input(text, context)
+        result.backend_used = GuardrailBackend.CUSTOM
+        result.original_text = text
+        if not result.passed and not result.modified_text:
+            from .actions import rewrite_text
+            result.modified_text = rewrite_text(text, result.detected_risks)
+        elif result.passed:
+            result.modified_text = text
+        return result
 
 
 # ── OpenAI Moderation backend ──────────────────────────────────────────────────
@@ -1542,6 +1735,120 @@ class OpenAIModerationBackend(GuardrailBackendInterface):
             }
         return {"status": "ok", "backend": GuardrailBackend.OPENAI_MODERATION.value}
 
+    # ── Async override using httpx.AsyncClient ────────────────────────────────
+
+    async def _acall_api_async(self, text: str) -> Tuple[bool, float, List[Dict]]:
+        """Async version of _call_api — uses httpx, includes 429 retry with asyncio.sleep."""
+        if time.monotonic() < OpenAIModerationBackend._quota_exhausted_until:
+            raise _httpx.HTTPStatusError(
+                "quota exhausted (circuit open)",
+                request=None,  # type: ignore[arg-type]
+                response=None,  # type: ignore[arg-type]
+            )
+        payload = {"input": text}
+        headers = {
+            "Authorization": f"Bearer {self._api_key()}",
+            "Content-Type": "application/json",
+        }
+        max_retries = 5
+        async with _httpx.AsyncClient(timeout=15.0) as client:
+            for attempt in range(max_retries):
+                resp = await client.post(self._API_URL, json=payload, headers=headers)
+                if resp.status_code == 429:
+                    if attempt < max_retries - 1:
+                        retry_after = resp.headers.get("retry-after")
+                        try:
+                            wait = float(retry_after) + 0.5 if retry_after else min(2 ** (attempt + 1), 60)
+                        except (ValueError, TypeError):
+                            wait = min(2 ** (attempt + 1), 60)
+                        self.logger.warning(
+                            "OpenAI Moderation 429 — waiting %.1fs (attempt %d/%d)",
+                            wait, attempt + 1, max_retries,
+                        )
+                        await _asyncio.sleep(wait)
+                        continue
+                    else:
+                        OpenAIModerationBackend._quota_exhausted_until = (
+                            time.monotonic() + OpenAIModerationBackend._QUOTA_COOLDOWN_SECS
+                        )
+                        self.logger.error(
+                            "OpenAI Moderation quota exhausted after %d retries", max_retries
+                        )
+                resp.raise_for_status()
+                data = resp.json()
+                break
+
+        item = data.get("results", [{}])[0]
+        flagged = bool(item.get("flagged", False))
+        categories = item.get("categories", {})
+        scores = item.get("category_scores", {})
+        risks: List[Dict] = [
+            {"type": self._CATEGORY_MAP.get(cat, RiskCategory.JAILBREAKING).value,
+             "category": cat, "score": scores.get(cat, 0.0), "source": "openai_moderation"}
+            for cat, is_flagged in categories.items() if is_flagged
+        ]
+        max_score = max(scores.values(), default=0.0) if scores else 0.0
+        return flagged, max_score, risks
+
+    async def acheck_input(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        if not self._api_key() or time.monotonic() < OpenAIModerationBackend._quota_exhausted_until:
+            return self._skipped_result()
+        result = GuardrailResult(backend_used=GuardrailBackend.OPENAI_MODERATION)
+        start = time.time()
+        try:
+            flagged, score, risks = await self._acall_api_async(text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = ActionType.BLOCK
+                result.severity = "critical"
+        except _httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code in (401, 403):
+                self.logger.warning("OpenAI Moderation auth error — marking SKIPPED")
+                return self._skipped_result(reason=f"Invalid API key (HTTP {exc.response.status_code})")
+            self.logger.error("OpenAI Moderation API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"OpenAI Moderation API error: {exc}")
+        except Exception as exc:
+            self.logger.error("OpenAI Moderation API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"OpenAI Moderation API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
+    async def acheck_output(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        if not self._api_key():
+            return self._skipped_result(text)
+        result = GuardrailResult(backend_used=GuardrailBackend.OPENAI_MODERATION)
+        start = time.time()
+        result.original_text = text
+        try:
+            flagged, score, risks = await self._acall_api_async(text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = ActionType.REDACT
+                result.severity = "critical"
+                from .actions import rewrite_text
+                result.modified_text = rewrite_text(text, risks)
+            else:
+                result.modified_text = text
+        except _httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code in (401, 403):
+                self.logger.warning("OpenAI Moderation auth error — marking SKIPPED")
+                return self._skipped_result(text, reason=f"Invalid API key (HTTP {exc.response.status_code})")
+            self.logger.error("OpenAI Moderation API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"OpenAI Moderation API error: {exc}")
+        except Exception as exc:
+            self.logger.error("OpenAI Moderation API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"OpenAI Moderation API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
 
 # ── Azure Content Safety backend ───────────────────────────────────────────────
 
@@ -1781,6 +2088,101 @@ class AzureContentSafetyBackend(GuardrailBackendInterface):
             }
         return {"status": "ok", "backend": GuardrailBackend.AZURE_CONTENT_SAFETY.value}
 
+    # ── Async override using httpx.AsyncClient ────────────────────────────────
+
+    async def _acall_api_async(self, text: str) -> Tuple[bool, float, List[Dict], int]:
+        endpoint = self._endpoint() or ""
+        api_key  = self._api_key()  or ""
+        safe_text = text[: self._MAX_TEXT_CHARS]
+        url = (
+            f"{endpoint.rstrip('/')}/contentsafety/text:analyze"
+            f"?api-version={self._API_VERSION}"
+        )
+        payload = {"text": safe_text}
+        headers = {"Ocp-Apim-Subscription-Key": api_key, "Content-Type": "application/json"}
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            for attempt in range(2):
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code == 408 and attempt == 0:
+                    self.logger.warning("Azure Content Safety timed out — retrying")
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+        max_severity = 0
+        risks: List[Dict] = []
+        for cat_result in data.get("categoriesAnalysis", []):
+            cat_name = cat_result.get("category", "")
+            severity = int(cat_result.get("severity", 0))
+            if severity > max_severity:
+                max_severity = severity
+            if severity > 0:
+                risk_cat = self._CATEGORY_MAP.get(cat_name, RiskCategory.JAILBREAKING)
+                risks.append({"type": risk_cat.value, "category": cat_name,
+                               "severity": severity, "source": "azure_content_safety"})
+        action = self._severity_to_action(max_severity)
+        flagged = action in (ActionType.ESCALATE, ActionType.BLOCK)
+        return flagged, round(max_severity / 6.0, 4), risks, max_severity
+
+    async def acheck_input(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        if not self._endpoint() or not self._api_key():
+            return self._skipped_result()
+        result = GuardrailResult(backend_used=GuardrailBackend.AZURE_CONTENT_SAFETY)
+        start = time.time()
+        try:
+            flagged, score, risks, max_severity = await self._acall_api_async(text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = self._severity_to_action(max_severity)
+                result.severity = "critical" if max_severity >= 5 else "warning"
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                self.logger.warning("Azure Content Safety auth error %d — marking SKIPPED", exc.response.status_code)
+                return self._skipped_result(reason=f"Invalid credentials (HTTP {exc.response.status_code})")
+            self.logger.error("Azure Content Safety API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Content Safety API error: {exc}")
+        except Exception as exc:
+            self.logger.error("Azure Content Safety API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Content Safety API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
+    async def acheck_output(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        if not self._endpoint() or not self._api_key():
+            return self._skipped_result(text)
+        result = GuardrailResult(backend_used=GuardrailBackend.AZURE_CONTENT_SAFETY)
+        start = time.time()
+        result.original_text = text
+        try:
+            flagged, score, risks, max_severity = await self._acall_api_async(text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = self._severity_to_action(max_severity)
+                result.severity = "critical" if max_severity >= 5 else "warning"
+                from .actions import rewrite_text
+                result.modified_text = rewrite_text(text, risks)
+            else:
+                result.modified_text = text
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                self.logger.warning("Azure Content Safety auth error %d — marking SKIPPED", exc.response.status_code)
+                return self._skipped_result(text, reason=f"Invalid credentials (HTTP {exc.response.status_code})")
+            self.logger.error("Azure Content Safety API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Content Safety API error: {exc}")
+        except Exception as exc:
+            self.logger.error("Azure Content Safety API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Content Safety API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
 
 # ── Azure Prompt Shields backend ───────────────────────────────────────────────
 
@@ -1966,6 +2368,90 @@ class AzurePromptShieldsBackend(GuardrailBackendInterface):
                 "reason": "AZURE_CONTENT_SAFETY_ENDPOINT or AZURE_CONTENT_SAFETY_KEY not configured",
             }
         return {"status": "ok", "backend": GuardrailBackend.AZURE_PROMPT_SHIELDS.value}
+
+    # ── Async override using httpx.AsyncClient ────────────────────────────────
+
+    async def _acall_api_async(self, text: str) -> Tuple[bool, float, List[Dict]]:
+        endpoint = self._endpoint() or ""
+        api_key  = self._api_key()  or ""
+        safe_text = text[: self._MAX_TEXT_CHARS]
+        url = (
+            f"{endpoint.rstrip('/')}/contentsafety/text:shieldPrompt"
+            f"?api-version={self._API_VERSION}"
+        )
+        payload = {"userPrompt": safe_text, "documents": []}
+        headers = {"Ocp-Apim-Subscription-Key": api_key, "Content-Type": "application/json"}
+        async with _httpx.AsyncClient(timeout=30.0) as client:
+            for attempt in range(2):
+                resp = await client.post(url, json=payload, headers=headers)
+                if resp.status_code == 408 and attempt == 0:
+                    continue
+                resp.raise_for_status()
+                data = resp.json()
+                break
+        attack_detected = bool(data.get("userPromptAnalysis", {}).get("attackDetected", False))
+        risks = [{"type": RiskCategory.PROMPT_INJECTION.value, "source": "azure_prompt_shields"}] if attack_detected else []
+        return attack_detected, (1.0 if attack_detected else 0.0), risks
+
+    async def acheck_input(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        result = GuardrailResult(backend_used=GuardrailBackend.AZURE_PROMPT_SHIELDS)
+        if not self._endpoint() or not self._api_key():
+            return self._skipped_result("AZURE_CONTENT_SAFETY_ENDPOINT or AZURE_CONTENT_SAFETY_KEY not configured")
+        start = time.time()
+        try:
+            flagged, score, risks = await self._acall_api_async(text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = ActionType.BLOCK
+                result.severity = "critical"
+                from .actions import rewrite_text
+                result.modified_text = rewrite_text(text, risks)
+            else:
+                result.modified_text = text
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                self.logger.warning("Azure Prompt Shields auth error %d — marking SKIPPED", exc.response.status_code)
+                return self._skipped_result(f"Invalid credentials (HTTP {exc.response.status_code})")
+            self.logger.error("Azure Prompt Shields API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Prompt Shields API error: {exc}")
+        except Exception as exc:
+            self.logger.error("Azure Prompt Shields API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Prompt Shields API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
+
+    async def acheck_output(self, text: str, _context: Optional[Dict] = None) -> GuardrailResult:
+        result = GuardrailResult(backend_used=GuardrailBackend.AZURE_PROMPT_SHIELDS)
+        if not self._endpoint() or not self._api_key():
+            return self._skipped_result("AZURE_CONTENT_SAFETY_ENDPOINT or AZURE_CONTENT_SAFETY_KEY not configured")
+        start = time.time()
+        try:
+            flagged, score, risks = await self._acall_api_async(text)
+            result.risk_score = score
+            result.passed = not flagged
+            result.detected_risks = risks
+            if flagged:
+                result.action = ActionType.BLOCK
+                result.severity = "critical"
+            else:
+                result.modified_text = text
+        except _httpx.HTTPStatusError as exc:
+            if exc.response.status_code in (401, 403):
+                self.logger.warning("Azure Prompt Shields auth error %d — marking SKIPPED", exc.response.status_code)
+                return self._skipped_result(f"Invalid credentials (HTTP {exc.response.status_code})")
+            self.logger.error("Azure Prompt Shields API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Prompt Shields API error: {exc}")
+        except Exception as exc:
+            self.logger.error("Azure Prompt Shields API error: %s", exc)
+            from .testing import fail_closed_result
+            return fail_closed_result(f"Azure Prompt Shields API error: {exc}")
+        result.latency_ms = (time.time() - start) * 1000
+        return result
 
 
 # ── AWS Bedrock Guardrails backend ─────────────────────────────────────────────
@@ -2706,6 +3192,177 @@ class GuardrailFramework:
         prom_metrics.record_decision(policy_id, policy.backend.value,
                                      result.action.value, result.passed,
                                      result.latency_ms, result.risk_score)
+        return result
+
+    # ── Async public API ───────────────────────────────────────────
+
+    async def check_input_async(
+        self,
+        text: str,
+        policy_id: str,
+        context: Optional[Dict] = None,
+        raise_on_block: bool = False,
+    ) -> GuardrailResult:
+        """
+        Async version of :meth:`check_input`.
+
+        Safe to ``await`` from FastAPI route handlers, LangChain callbacks, and
+        any other async context.  For HTTP-backed guardrail backends (Lakera,
+        OpenAI Moderation, Azure, Custom HTTP) no thread-pool is used — the
+        network call is a true ``httpx.AsyncClient`` coroutine.  SDK-backed
+        backends (NeMo, Presidio, LlamaFirewall, LLM Guard) run in the default
+        executor so they never block the event loop.
+
+        Parameters
+        ----------
+        raise_on_block:
+            When ``True``, raises :class:`GuardrailBlocked` instead of returning
+            a failed result.  Useful for exception-flow control in route handlers.
+        """
+        from .testing import fail_closed_result
+        from .opa_gaps import data_registry, status_reporter, prom_metrics
+
+        policy = self._get_policy(policy_id)
+        if policy is None:
+            result = fail_closed_result(f"Policy not found: {policy_id}")
+            if raise_on_block:
+                raise GuardrailBlocked(result)
+            return result
+
+        backend = self.backends.get(policy.backend.value)
+        if not backend:
+            result = fail_closed_result(f"Backend not configured: {policy.backend.value}")
+            if raise_on_block:
+                raise GuardrailBlocked(result)
+            return result
+
+        rate_result = self._rate_limit_check(policy, context)
+        if rate_result:
+            self._log_audit(policy_id, "input_check", text, rate_result)
+            if raise_on_block:
+                raise GuardrailBlocked(rate_result)
+            return rate_result
+
+        enriched = data_registry.enrich(context or {})
+        self._inject_policy_rules(backend, policy)
+
+        try:
+            result = await backend.acheck_input(text, enriched)
+        except Exception as exc:
+            self.logger.error(f"Backend error in check_input_async: {exc}")
+            result = fail_closed_result(str(exc))
+
+        result = self._apply_post_actions(result, policy, policy_id)
+        self._log_audit(policy_id, "input_check", text, result)
+        status_reporter.record(policy_id, policy.backend.value, result.passed, result.latency_ms)
+        prom_metrics.record_decision(policy_id, policy.backend.value,
+                                     result.action.value, result.passed,
+                                     result.latency_ms, result.risk_score)
+        if raise_on_block and not result.passed:
+            raise GuardrailBlocked(result)
+        return result
+
+    async def check_output_async(
+        self,
+        text: str,
+        policy_id: str,
+        context: Optional[Dict] = None,
+        raise_on_block: bool = False,
+    ) -> GuardrailResult:
+        """Async version of :meth:`check_output`. See :meth:`check_input_async` for full docs."""
+        from .testing import fail_closed_result
+        from .opa_gaps import data_registry, status_reporter, prom_metrics
+
+        policy = self._get_policy(policy_id)
+        if policy is None:
+            result = fail_closed_result(f"Policy not found: {policy_id}")
+            if raise_on_block:
+                raise GuardrailBlocked(result)
+            return result
+
+        backend = self.backends.get(policy.backend.value)
+        if not backend:
+            result = fail_closed_result(f"Backend not configured: {policy.backend.value}")
+            if raise_on_block:
+                raise GuardrailBlocked(result)
+            return result
+
+        rate_result = self._rate_limit_check(policy, context)
+        if rate_result:
+            self._log_audit(policy_id, "output_check", text, rate_result)
+            if raise_on_block:
+                raise GuardrailBlocked(rate_result)
+            return rate_result
+
+        enriched = data_registry.enrich(context or {})
+        self._inject_policy_rules(backend, policy)
+
+        try:
+            result = await backend.acheck_output(text, enriched)
+        except Exception as exc:
+            self.logger.error(f"Backend error in check_output_async: {exc}")
+            result = fail_closed_result(str(exc))
+
+        result = self._apply_post_actions(result, policy, policy_id)
+        self._log_audit(policy_id, "output_check", text, result)
+        status_reporter.record(policy_id, policy.backend.value, result.passed, result.latency_ms)
+        prom_metrics.record_decision(policy_id, policy.backend.value,
+                                     result.action.value, result.passed,
+                                     result.latency_ms, result.risk_score)
+        if raise_on_block and not result.passed:
+            raise GuardrailBlocked(result)
+        return result
+
+    async def validate_tool_call_async(
+        self,
+        policy_id: str,
+        tool_name: str,
+        tool_args: Dict[str, Any],
+        context: Optional[Dict] = None,
+        raise_on_block: bool = False,
+    ) -> GuardrailResult:
+        """Async version of :meth:`validate_tool_call`. See :meth:`check_input_async` for full docs."""
+        from .testing import fail_closed_result
+        from .opa_gaps import data_registry, status_reporter, prom_metrics
+
+        policy = self._get_policy(policy_id)
+        if policy is None:
+            result = fail_closed_result(f"Policy not found: {policy_id}")
+            if raise_on_block:
+                raise GuardrailBlocked(result)
+            return result
+
+        backend = self.backends.get(policy.backend.value)
+        if not backend:
+            result = fail_closed_result(f"Backend not configured: {policy.backend.value}")
+            if raise_on_block:
+                raise GuardrailBlocked(result)
+            return result
+
+        rate_result = self._rate_limit_check(policy, context)
+        if rate_result:
+            self._log_audit(policy_id, "tool_validation", tool_name, rate_result)
+            if raise_on_block:
+                raise GuardrailBlocked(rate_result)
+            return rate_result
+
+        enriched = data_registry.enrich(context or {})
+        self._inject_policy_rules(backend, policy)
+
+        try:
+            result = await backend.avalidate_tool_call(tool_name, tool_args, enriched)
+        except Exception as exc:
+            self.logger.error(f"Backend error in validate_tool_call_async: {exc}")
+            result = fail_closed_result(str(exc))
+
+        result = self._apply_post_actions(result, policy, policy_id)
+        self._log_audit(policy_id, "tool_validation", tool_name, result)
+        status_reporter.record(policy_id, policy.backend.value, result.passed, result.latency_ms)
+        prom_metrics.record_decision(policy_id, policy.backend.value,
+                                     result.action.value, result.passed,
+                                     result.latency_ms, result.risk_score)
+        if raise_on_block and not result.passed:
+            raise GuardrailBlocked(result)
         return result
 
     # ── Post-action handlers ───────────────────────────────────────

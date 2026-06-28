@@ -3,7 +3,7 @@
 **Unified AI guardrail enforcement layer. Provider-agnostic. OWASP LLM Top 10.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.1-orange.svg)](https://pypi.org/project/guardrailmesh/)
+[![PyPI version](https://img.shields.io/badge/PyPI-v0.2.0-orange.svg)](https://pypi.org/project/guardrailmesh/)
 [![Backends](https://img.shields.io/badge/Backends-10-blue.svg)](guardrail_framework/core.py)
 
 ---
@@ -77,6 +77,76 @@ guardrailmesh serve
 # → http://localhost:8000  (REST API + Swagger UI at /docs)
 # → http://localhost:8000/app  (React dashboard)
 ```
+
+---
+
+## Async usage (FastAPI / asyncio)
+
+All three check methods have native async variants that are safe to `await` from any async context:
+
+```python
+from guardrail_framework.core import GuardrailFramework, GuardrailPolicy, GuardrailBackend
+from guardrail_framework import GuardrailBlocked
+
+framework = GuardrailFramework()
+policy_id = framework.create_policy(GuardrailPolicy(
+    name="Banking Safety Policy",
+    backend=GuardrailBackend.LAKERA,
+    sensitivity="high",
+))
+
+# In a FastAPI route handler
+@app.post("/chat")
+async def chat(request: ChatRequest):
+    # Option A — check result manually
+    result = await framework.check_input_async(request.message, policy_id)
+    if not result.passed:
+        raise HTTPException(status_code=400, detail={"blocked": True, "risks": result.detected_risks})
+
+    # Option B — exception flow (raise_on_block=True)
+    try:
+        await framework.check_input_async(request.message, policy_id, raise_on_block=True)
+    except GuardrailBlocked as exc:
+        return {"error": "blocked", "action": exc.result.action.value}
+
+    response = await llm.generate(request.message)
+
+    await framework.check_output_async(response, policy_id, raise_on_block=True)
+    return {"response": response}
+```
+
+### FastAPI middleware (3-line integration)
+
+Apply guardrail checks to every mutating request without touching route handlers:
+
+```python
+from guardrail_framework.middleware import GuardrailMiddleware
+
+app.add_middleware(
+    GuardrailMiddleware,
+    framework=framework,
+    policy_id=policy_id,
+    text_field="message",   # JSON body field to inspect (default: "message")
+)
+```
+
+The middleware short-circuits with HTTP 400 when a check fails; the route handler is never called. Probe endpoints (`/health`, `/ready`, `/docs`) are automatically bypassed.
+
+### Backend async behaviour
+
+| Backend | Async implementation |
+|---|---|
+| Lakera Guard | `httpx.AsyncClient` — true coroutine, no threads |
+| OpenAI Moderation | `httpx.AsyncClient` + async retry / 429 back-off |
+| Azure Content Safety | `httpx.AsyncClient` — true coroutine, no threads |
+| Azure Prompt Shields | `httpx.AsyncClient` — true coroutine, no threads |
+| Custom HTTP | `httpx.AsyncClient` — true coroutine, no threads |
+| NeMo Guardrails | `loop.run_in_executor` — sync SDK offloaded to thread pool |
+| GuardrailsAI | `loop.run_in_executor` — sync SDK offloaded to thread pool |
+| Microsoft Presidio | `loop.run_in_executor` — CPU-bound NLP offloaded to thread pool |
+| LlamaFirewall | `loop.run_in_executor` — local model offloaded to thread pool |
+| LLM Guard | `loop.run_in_executor` — local model offloaded to thread pool |
+| AWS Bedrock | `loop.run_in_executor` — boto3 is sync-only |
 
 ---
 

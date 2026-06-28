@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.0] — 2026-06-28
+
+### Added
+
+- **Async-native core** — `GuardrailFramework` now exposes `async def check_input_async()`, `async def check_output_async()`, and `async def validate_tool_call_async()`. Safe to `await` from FastAPI route handlers, LangChain callbacks, and any other async context. All three accept an optional `raise_on_block=True` parameter.
+- **`GuardrailBlocked` exception** — raised when `raise_on_block=True` and a check fails. Carries the full `GuardrailResult` as `.result` for downstream handling.
+- **`GuardrailError` exception** — base class for internal framework errors; available for callers that want to handle guardrail failures separately from other exceptions.
+- **True async HTTP for REST-backed backends** — Lakera Guard, OpenAI Moderation, Azure Content Safety, Azure Prompt Shields, and the Custom HTTP adapter now implement `acheck_input` / `acheck_output` using `httpx.AsyncClient` instead of thread-pool offloading. No threads consumed for network I/O on these backends.
+- **Thread-pool fallback async for SDK-backed backends** — NeMo Guardrails, GuardrailsAI, Presidio, LlamaFirewall, LLM Guard, and AWS Bedrock backends implement `acheck_input` / `acheck_output` via `loop.run_in_executor(None, ...)`, so awaiting them never blocks the event loop even though the underlying SDK is synchronous.
+- **`GuardrailMiddleware`** — Starlette/FastAPI ASGI middleware that runs `check_input_async` before every mutating request (`POST`, `PUT`, `PATCH`). Short-circuits with HTTP 400 when blocked. Configurable `text_field`, `skip_paths`, and `on_block_status`. Available from `guardrail_framework.middleware`.
+- `httpx.AsyncClient` is used for all async backend HTTP calls; `httpx>=0.24.0` was already a core dependency.
+
+### Changed
+
+- `__version__` bumped to `0.2.0`.
+- `__all__` in `guardrail_framework/__init__.py` extended with `GuardrailBlocked`, `GuardrailError`, `GuardrailMiddleware`.
+
+---
+
 ## [0.1.1] — 2026-06-28
 
 ### Security / Production hardening
