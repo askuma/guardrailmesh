@@ -2947,24 +2947,46 @@ class GuardrailFramework:
         self.backends[GuardrailBackend.LLAMA_FIREWALL.value]       = LlamaFirewallBackend({})
         self.backends[GuardrailBackend.LLM_GUARD.value]            = LLMGuardBackend({})
 
-        any_real_sdk = (
+        any_real_sdk = bool(
             _NEMO_SDK
             or _GUARDRAILSAI_SDK
             or _PRESIDIO_SDK
+            or _LLAMAFIREWALL_SDK    # local model, no API key needed
+            or _LLM_GUARD_SDK       # local model, no API key needed
             or os.getenv("LAKERA_GUARD_API_KEY", "").strip()
             or os.getenv("GA_GUARD_API_URL", "").strip()
+            or os.getenv("OPENAI_API_KEY", "").strip()
+            or (os.getenv("AZURE_CONTENT_SAFETY_ENDPOINT", "").strip()
+                and os.getenv("AZURE_CONTENT_SAFETY_KEY", "").strip())
+            or (os.getenv("AWS_BEDROCK_GUARDRAIL_ID", "").strip()
+                and os.getenv("AWS_DEFAULT_REGION", "").strip())
         )
         if not any_real_sdk:
-            self.logger.warning(
-                "No guardrail SDK detected. All backends will use the built-in "
-                "regex/keyword scorer, which is NOT sufficient for production AI "
-                "safety. Install at least one real backend:\n"
-                "  • pip install guardrails-ai   (GuardrailsAI)\n"
-                "  • pip install nemoguardrails  (NVIDIA NeMo)\n"
-                "  • pip install presidio-analyzer presidio-anonymizer  (PII)\n"
-                "  • Set LAKERA_GUARD_API_KEY for the Lakera cloud backend\n"
-                "  • Set GA_GUARD_API_URL for the custom HTTP adapter"
+            msg = (
+                "No real guardrail backend detected — all checks will use the "
+                "built-in regex/keyword scorer, which is NOT sufficient for "
+                "production AI safety.\n"
+                "Install or configure at least one backend:\n"
+                "  Local (no API key):\n"
+                "    pip install llamafirewall          # LlamaFirewall (Meta PromptGuard)\n"
+                "    pip install llm-guard              # LLM Guard (PromptInjection + Toxicity)\n"
+                "    pip install presidio-analyzer presidio-anonymizer  # PII redaction\n"
+                "  Cloud:\n"
+                "    Set LAKERA_GUARD_API_KEY           # Lakera Guard\n"
+                "    Set OPENAI_API_KEY                 # OpenAI Moderation\n"
+                "    Set AZURE_CONTENT_SAFETY_ENDPOINT + AZURE_CONTENT_SAFETY_KEY\n"
+                "    Set AWS_BEDROCK_GUARDRAIL_ID + AWS_DEFAULT_REGION\n"
+                "  Framework SDKs:\n"
+                "    pip install guardrails-ai          # GuardrailsAI\n"
+                "    pip install nemoguardrails         # NVIDIA NeMo Guardrails"
             )
+            # Escalate to ERROR when a production database is configured — the
+            # regex fallback is almost certainly insufficient in that context.
+            db_url = os.getenv("GUARDRAIL_DB_URL", "sqlite://")
+            if not db_url.startswith("sqlite"):
+                self.logger.error("PRODUCTION SAFETY RISK: %s", msg)
+            else:
+                self.logger.warning(msg)
 
     def set_persistence(self, layer: Any):
         """Wire in a PersistenceLayer. Call from server startup."""

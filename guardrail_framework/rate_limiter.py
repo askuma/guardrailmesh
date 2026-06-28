@@ -115,6 +115,14 @@ class PolicyRateLimiter:
                     "in-process token buckets. Limits will NOT be shared across "
                     "replicas until Redis is reachable.", exc
                 )
+        else:
+            _log.warning(
+                "GUARDRAIL_REDIS_URL is not set — rate limits use in-process "
+                "token buckets. Each replica enforces limits independently: the "
+                "effective limit under N replicas is N × max_requests_per_minute. "
+                "Set GUARDRAIL_REDIS_URL=rediss://... for consistent cross-replica "
+                "enforcement in multi-instance deployments."
+            )
 
         self._buckets: Dict[str, TokenBucket] = {}
         self._lock = threading.Lock()

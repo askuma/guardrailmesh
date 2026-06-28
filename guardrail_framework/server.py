@@ -740,6 +740,7 @@ def configure_decision_log(cfg: DecisionLogConfig):
         max_chunk_size=cfg.max_chunk_size,
         flush_interval_secs=cfg.flush_interval_secs,
         auth_token=cfg.auth_token,
+        persistence_layer=framework._persistence,
     )
     _decision_shipper.start()
     return {"message": "Decision log shipper started", "sink_url": cfg.sink_url}

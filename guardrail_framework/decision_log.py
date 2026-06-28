@@ -94,6 +94,7 @@ class DecisionLogShipper:
         max_retries: int = 5,
         upload_size_limit_bytes: int = 1_000_000,   # 1 MB per chunk
         auth_token: Optional[str] = None,
+        persistence_layer: Optional[Any] = None,
     ):
         self.sink_url = sink_url
         self.max_chunk_size = max_chunk_size
@@ -101,6 +102,7 @@ class DecisionLogShipper:
         self.max_retries = max_retries
         self.upload_size_limit_bytes = upload_size_limit_bytes
         self.auth_token = auth_token
+        self._persistence = persistence_layer  # PersistenceLayer used as dead-letter store
 
         self._queue: queue.Queue[DecisionEvent] = queue.Queue(maxsize=50_000)
         self._stop_event = threading.Event()
@@ -110,6 +112,7 @@ class DecisionLogShipper:
         self.events_enqueued: int = 0
         self.events_shipped: int = 0
         self.events_dropped: int = 0
+        self.events_dead_lettered: int = 0
         self.upload_errors: int = 0
         self.last_upload_at: Optional[str] = None
         self.last_error: Optional[str] = None
@@ -138,14 +141,44 @@ class DecisionLogShipper:
 
     # ── enqueue ────────────────────────────────────────────────
 
+    def _dead_letter(self, events: List[DecisionEvent], reason: str) -> None:
+        """
+        Persist events to the local audit_log table when they cannot be shipped.
+
+        This prevents compliance audit gaps when the remote sink is unavailable
+        or the in-memory queue is full.  The ``extra`` JSON column stores the
+        full decision event so events can be replayed later.
+        """
+        if not self._persistence:
+            return
+        for event in events:
+            try:
+                self._persistence.append_audit({
+                    "policy_id":    event.policy_id,
+                    "action":       "decision_log_dead_letter",
+                    "passed":       event.passed,
+                    "severity":     "warning",
+                    "action_taken": event.action_taken,
+                    "risk_score":   event.risk_score,
+                    "latency_ms":   event.latency_ms,
+                    "backend":      event.backend,
+                    "request_id":   event.decision_id,
+                    "dead_letter_reason": reason,
+                    **asdict(event),
+                })
+                self.events_dead_lettered += 1
+            except Exception as exc:
+                logger.error("Dead-letter write to audit_log failed: %s", exc)
+
     def enqueue(self, event: DecisionEvent):
-        """Non-blocking enqueue. Drops if queue is full."""
+        """Non-blocking enqueue. On queue-full, falls back to the dead-letter store."""
         try:
             self._queue.put_nowait(event)
             self.events_enqueued += 1
         except queue.Full:
             self.events_dropped += 1
-            logger.warning("DecisionLogShipper queue full — event dropped")
+            logger.warning("DecisionLogShipper queue full — writing to dead-letter store")
+            self._dead_letter([event], "queue_full")
 
     def enqueue_from_result(
         self,
@@ -211,9 +244,18 @@ class DecisionLogShipper:
             self._upload_chunk(events[mid:])
             return
 
-        self._post_with_retry(payload, len(events))
+        if not self._post_with_retry(payload, len(events)):
+            # All retries exhausted — persist to local audit_log so the
+            # events are not lost entirely (dead-letter pattern).
+            logger.error(
+                "Giving up after %d attempts — writing %d events to dead-letter store",
+                self.max_retries, len(events),
+            )
+            self.events_dropped += len(events)
+            self._dead_letter(events, "upload_failed")
 
-    def _post_with_retry(self, payload: bytes, n: int):
+    def _post_with_retry(self, payload: bytes, n: int) -> bool:
+        """Return True on success, False after all retries are exhausted."""
         headers: Dict[str, str] = {"Content-Type": "application/json"}
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
@@ -228,7 +270,7 @@ class DecisionLogShipper:
                         self.events_shipped += n
                         self.last_upload_at = datetime.now(timezone.utc).isoformat()
                         logger.debug(f"Shipped {n} events (attempt {attempt+1})")
-                        return
+                        return True
                     logger.warning(f"Sink returned HTTP {resp.status}")
             except Exception as exc:
                 self.last_error = str(exc)
@@ -238,8 +280,7 @@ class DecisionLogShipper:
                 if attempt < self.max_retries - 1:
                     time.sleep(wait)
 
-        logger.error(f"Giving up after {self.max_retries} attempts — {n} events lost")
-        self.events_dropped += n
+        return False
 
     # ── introspection ──────────────────────────────────────────
 
@@ -250,8 +291,10 @@ class DecisionLogShipper:
             "events_enqueued": self.events_enqueued,
             "events_shipped": self.events_shipped,
             "events_dropped": self.events_dropped,
+            "events_dead_lettered": self.events_dead_lettered,
             "upload_errors": self.upload_errors,
             "last_upload_at": self.last_upload_at,
             "last_error": self.last_error,
             "running": bool(self._thread and self._thread.is_alive()),
+            "dead_letter_store": "audit_log" if self._persistence else "none",
         }
