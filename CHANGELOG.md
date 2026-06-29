@@ -1,5 +1,20 @@
 # Changelog
 
+## [Unreleased]
+
+---
+
+## [0.2.1] — 2026-06-28
+
+### Security
+
+- **F1 — Admin key required on decision-log endpoints.** `POST /decision-log/configure` and `POST /decision-log/stop` now require `require_admin_key`. Previously any valid API key could reconfigure or halt the audit shipper, enabling audit trail manipulation.
+- **F2 — PII scrubbed from dead-letter store.** `DecisionLogShipper._dead_letter()` now strips the raw `"text"` field from `detected_risks` before writing to the local `audit_log` table, preventing matched PII spans (email addresses, card numbers, SSNs) from leaking into persistent storage.
+- **F3 — Admin key required on policy update endpoint.** `PATCH /policies/{policy_id}` now requires `require_admin_key`. Previously regular caller keys could weaken enforcement thresholds on live policies.
+- **F4 — Async race condition in `_inject_policy_rules`.** `check_input_async`, `check_output_async`, and `validate_tool_call_async` now acquire a per-backend `asyncio.Lock` around the `_inject_policy_rules` call and the subsequent `await`, eliminating a race where an event-loop yield between config mutation and the actual check allowed another coroutine to overwrite shared backend config.
+
+---
+
 ## [0.2.0] — 2026-06-28
 
 ### Added

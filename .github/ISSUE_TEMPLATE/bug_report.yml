@@ -1,0 +1,95 @@
+name: Bug report
+description: Something is broken or behaving unexpectedly
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. Fill in as much detail as you can — the more context you provide, the faster we can reproduce and fix it.
+
+        **Security vulnerabilities:** do not use this form. See [SECURITY.md](../SECURITY.md) for the private disclosure process.
+
+  - type: input
+    id: version
+    attributes:
+      label: guardrailmesh version
+      placeholder: "e.g. 0.2.1"
+    validations:
+      required: true
+
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "e.g. 3.11.4"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: backend
+    attributes:
+      label: Backend(s) involved
+      multiple: true
+      options:
+        - nemo
+        - guardrails_ai
+        - presidio
+        - lakera
+        - openai_moderation
+        - azure_content_safety
+        - azure_prompt_shields
+        - aws_bedrock
+        - llama_firewall
+        - llm_guard
+        - custom
+        - regex fallback (no backend installed)
+        - not backend-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened?
+      description: A clear description of what went wrong.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Minimal code or curl commands that trigger the bug.
+      placeholder: |
+        ```python
+        from guardrail_framework.core import GuardrailFramework
+        ...
+        ```
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs or error output
+      description: Paste stack traces, log lines, or HTTP responses here. Redact any credentials or PII.
+      render: text
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I am not reporting a security vulnerability (those go to SECURITY.md)
+          required: true
+        - label: I have redacted any credentials, API keys, or personal data from logs
+          required: true

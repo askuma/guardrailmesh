@@ -1,0 +1,58 @@
+name: Feature request
+description: Propose a new feature or improvement
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please check [existing issues](https://github.com/askuma/guardrailmesh/issues) first to avoid duplicates.
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - New backend adapter
+        - Async / FastAPI integration
+        - Policy engine (new action, rule type, etc.)
+        - REST API endpoint
+        - Decision log / audit
+        - Rate limiting
+        - Observability / metrics
+        - Dashboard (React UI)
+        - Testing utilities
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the use case or pain point. "I want X" is less useful than "When I do Y, I can't Z because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe what you'd like to see. Include API sketches, config shapes, or examples if helpful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or alternative approaches exist today?
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and this is not a duplicate
+          required: true
+        - label: I am willing to open a PR for this if the approach is agreed
