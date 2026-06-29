@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "guardrailmesh"
-version = "0.2.1"
+version = "0.1.0"
 description = "Unified AI guardrail enforcement layer. Provider-agnostic. OWASP LLM Top 10."
 readme = "README.md"
 license = { file = "LICENSE" }

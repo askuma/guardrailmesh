@@ -3,7 +3,7 @@
 **Unified AI guardrail enforcement layer. Provider-agnostic. OWASP LLM Top 10.**
 
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
-[![PyPI version](https://img.shields.io/badge/PyPI-v0.2.0-orange.svg)](https://pypi.org/project/guardrailmesh/)
+[![PyPI version](https://img.shields.io/badge/PyPI-v0.1.0-orange.svg)](https://pypi.org/project/guardrailmesh/)
 [![Backends](https://img.shields.io/badge/Backends-10-blue.svg)](guardrail_framework/core.py)
 
 ---
