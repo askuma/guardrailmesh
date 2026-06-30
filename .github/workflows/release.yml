@@ -51,6 +51,8 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         # Uses OIDC trusted publishing — no API token needed.
         # Configure at: https://pypi.org/manage/project/guardrailmesh/settings/publishing/
+        with:
+          skip-existing: true   # gracefully skip if this version is already on PyPI
 
   github-release:
     name: Create GitHub release
